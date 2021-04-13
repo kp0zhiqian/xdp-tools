@@ -28,6 +28,7 @@ addons:
       name: "xdp-project/xdp-tools"
       description: "Tools for using XDP"
     notification_email: toke@redhat.com
+    build_command_prepend: "make clean"
     build_command: "make V=1"
     branch_pattern: coverity_scan
 
