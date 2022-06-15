@@ -448,7 +448,7 @@ static int xsk_get_max_queues(char *ifname)
 	}
 
 	if (err) {
-		/* If the device says it has no channels, 
+		/* If the device says it has no channels,
 		 * try to get rx tx from sysfs, otherwise all traffic
 		 * is sent to a single stream, so max queues = 1.
 		 */
@@ -483,7 +483,7 @@ static int xsk_size_map(struct xdp_program *xdp_prog, char *ifname)
 	if (!map)
 		return -ENOENT;
 
-	err = bpf_map__resize(map, max_queues);
+	err = bpf_map__set_max_entries(map, max_queues);
 	if (err)
 		return err;
 
@@ -646,7 +646,7 @@ static struct xdp_program *xsk_lookup_program(int ifindex)
 
 	if (xdp_multiprog__is_legacy(multi_prog)) {
 		prog = xdp_multiprog__main_prog(multi_prog);
-		goto out;
+		goto check;
 	}
 
 	while ((prog = xdp_multiprog__next_prog(prog, multi_prog)))
@@ -654,18 +654,25 @@ static struct xdp_program *xsk_lookup_program(int ifindex)
 			break;
 
 	if (!prog)
-		return NULL;
+		goto out;
 
-out:
+check:
 	err = check_xdp_prog_version(xdp_program__btf(prog), version_name, &version);
-	if (err)
-		return ERR_PTR(err);
+	if (err) {
+		prog = ERR_PTR(err);
+		goto out;
+	}
 	if (version > XSK_PROG_VERSION) {
 		pr_warn("XSK default program version %d higher than supported %d\n", version,
 			XSK_PROG_VERSION);
-		return ERR_PTR(-EOPNOTSUPP);
+		prog = ERR_PTR(-EOPNOTSUPP);
 	}
 
+out:
+	if (!IS_ERR_OR_NULL(prog))
+		prog = xdp_program__clone(prog, 0);
+
+	xdp_multiprog__close(multi_prog);
 	return prog;
 }
 
@@ -674,15 +681,15 @@ static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 	const char *fallback_prog = "xsk_def_xdp_prog_5.3.o";
 	const char *default_prog = "xsk_def_xdp_prog.o";
 	struct xsk_ctx *ctx = xsk->ctx;
-	struct xdp_program *prog;
 	const char *file_name;
+	bool attached = false;
 	int err;
 
-	prog = xsk_lookup_program(ctx->ifindex);
-	if (IS_ERR(prog))
-		return PTR_ERR(prog);
+	ctx->xdp_prog = xsk_lookup_program(ctx->ifindex);
+	if (IS_ERR(ctx->xdp_prog))
+		return PTR_ERR(ctx->xdp_prog);
 
-	if (!prog) {
+	if (!ctx->xdp_prog) {
 		file_name = xsk_check_redirect_flags() ? default_prog : fallback_prog;
 		ctx->xdp_prog = xdp_program__find_file(file_name, NULL, NULL);
 		if (IS_ERR(ctx->xdp_prog))
@@ -697,10 +704,7 @@ static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 		if (err)
 			goto err_prog_load;
 
-	} else {
-		ctx->xdp_prog = xdp_program__clone(prog);
-		if (IS_ERR(ctx->xdp_prog))
-			return PTR_ERR(ctx->xdp_prog);
+		attached = true;
 	}
 
 	ctx->xsks_map_fd = xsk_lookup_bpf_map(xdp_program__fd(ctx->xdp_prog));
@@ -720,7 +724,7 @@ static int __xsk_setup_xdp_prog(struct xsk_socket *xsk, int *xsks_map_fd)
 	return 0;
 
 err_lookup:
-	if (!prog)
+	if (attached)
 		xdp_program__detach(ctx->xdp_prog, ctx->ifindex,
 				    xsk_convert_xdp_flags(xsk->config.xdp_flags), 0);
 err_prog_load:
@@ -1046,11 +1050,22 @@ int xsk_socket__create(struct xsk_socket **xsk_ptr, const char *ifname,
 
 int xsk_umem__delete(struct xsk_umem *umem)
 {
+	struct xdp_mmap_offsets off;
+	int err;
+
 	if (!umem)
 		return 0;
 
 	if (umem->refcount)
 		return -EBUSY;
+
+	err = xsk_get_mmap_offsets(umem->fd, &off);
+	if (!err && umem->fill_save && umem->comp_save) {
+		munmap(umem->fill_save->ring - off.fr.desc,
+		       off.fr.desc + umem->config.fill_size * sizeof(__u64));
+		munmap(umem->comp_save->ring - off.cr.desc,
+		       off.cr.desc + umem->config.comp_size * sizeof(__u64));
+	}
 
 	close(umem->fd);
 	free(umem);

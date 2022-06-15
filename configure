@@ -89,6 +89,20 @@ check_toolchain()
     echo "ARCH_INCLUDES:=$ARCH_INCLUDES" >> $CONFIG
 }
 
+check_zlib()
+{
+    if ${PKG_CONFIG} zlib --exists; then
+        echo "HAVE_ZLIB:=y" >>$CONFIG
+        echo "yes"
+
+        echo 'CFLAGS += -DHAVE_ZLIB' `${PKG_CONFIG} zlib --cflags` >> $CONFIG
+        echo 'LDLIBS += ' `${PKG_CONFIG} zlib --libs` >>$CONFIG
+    else
+        echo "missing - this is required"
+        return 1
+    fi
+}
+
 check_elf()
 {
     if ${PKG_CONFIG} libelf --exists; then
@@ -136,20 +150,6 @@ EOF
     fi
 }
 
-check_zlib()
-{
-    if ${PKG_CONFIG} zlib --exists; then
-        echo "HAVE_ZLIB:=y" >>$CONFIG
-        echo "yes"
-
-        echo 'CFLAGS += -DHAVE_ZLIB' `${PKG_CONFIG} zlib --cflags` >> $CONFIG
-        echo 'LDLIBS += ' `${PKG_CONFIG} zlib --libs` >>$CONFIG
-    else
-        echo "missing - this is required"
-        return 1
-    fi
-}
-
 
 check_libbpf_function()
 {
@@ -177,6 +177,16 @@ check_libbpf_function()
         return 0;
     fi
 
+    # If this is set we don't try to link against libbpf, as it may be in a
+    # different submodule and have not been built yet. Instead, we'll copy over the
+    if [ -n "$LIBBPF_UNBUILT" ]; then
+        LIBBPF_LDLIBS="-Xlinker --unresolved-symbols=ignore-in-object-files"
+        LIBBPF_CFLAGS="-I$TMPDIR/include"
+        mkdir -p "$TMPDIR/include/bpf"
+        cp "$LIBBPF_DIR"/src/{bpf,btf,libbpf*}.h "$TMPDIR/include/bpf"
+        [ "$?" -eq 0 ] || return
+    fi
+
     cat >$TMPDIR/libbpftest.c <<EOF
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -186,12 +196,17 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-    libbpf_err=$($CC -o $TMPDIR/libbpftest $TMPDIR/libbpftest.c -Werror $LIBBPF_CFLAGS $LIBBPF_LDLIBS 2>&1)
+    compile_cmd="$CC -o $TMPDIR/libbpftest $TMPDIR/libbpftest.c -Werror $LIBBPF_CFLAGS $LIBBPF_LDLIBS"
+    libbpf_err=$($compile_cmd 2>&1)
     if [ "$?" -eq "0" ]; then
         echo "HAVE_FEATURES+=${config_var}" >>"$CONFIG"
         echo "yes"
     else
         echo "no"
+    fi
+    if [ -n "$DEBUG_CONFIGURE" ]; then
+        echo "    $compile_cmd"
+        echo "${libbpf_err}" | sed 's/^/    /gm'
     fi
 }
 
@@ -210,6 +225,7 @@ check_libbpf_functions()
     check_libbpf_function "bpf_program__insn_cnt" "(NULL)" "$LIBBPF_CFLAGS" "$LIBBPF_LDLIBS"
     check_libbpf_function "bpf_map_create" "(0, NULL, 0, 0, 0, NULL)" "$LIBBPF_CFLAGS" "$LIBBPF_LDLIBS"
     check_libbpf_function "perf_buffer__new_raw" "(0, 0, NULL, NULL, NULL, NULL)" "$LIBBPF_CFLAGS" "$LIBBPF_LDLIBS"
+    check_libbpf_function "bpf_xdp_attach" "(0, 0, 0, NULL)" "$LIBBPF_CFLAGS" "$LIBBPF_LDLIBS"
 }
 
 get_libbpf_version()
@@ -305,14 +321,14 @@ EOF
     echo 'LDLIBS += -l:libbpf.a' >>$CONFIG
     echo "OBJECT_LIBBPF = ${OBJECT_LIBBPF}" >>$CONFIG
 
+    echo -n "zlib support: "
+    check_zlib || exit 1
+
     echo -n "ELF support: "
     check_elf || exit 1
 
     echo -n "pcap support: "
     check_pcap || exit 1
-
-    echo -n "zlib support: "
-    check_zlib || exit 1
 
 }
 

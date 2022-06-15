@@ -50,6 +50,10 @@
 #define PROG_NAME "xdpdump"
 #define DEFAULT_SNAP_LEN 262144
 
+#ifndef ENOTSUPP
+#define ENOTSUPP         524 /* Operation is not supported */
+#endif
+
 #define RX_FLAG_FENTRY (1<<0)
 #define RX_FLAG_FEXIT  (1<<1)
 
@@ -1281,6 +1285,17 @@ static bool add_interfaces_to_pcapng(struct dumpopt *cfg,
 	return true;
 }
 
+static void print_compat_error(const char *what)
+{
+#if defined(__x86_64__) || defined(__i686__)
+	pr_warn("ERROR: The kernel does not support "
+		"fentry %s because it is too old!", what);
+#else
+	pr_warn("ERROR: The kernel does not support "
+		"fentry %s on the current CPU architecture!", what);
+#endif
+}
+
 /*****************************************************************************
  * load_and_attach_trace()
  *****************************************************************************/
@@ -1296,7 +1311,6 @@ static bool load_and_attach_trace(struct dumpopt *cfg,
 	struct bpf_link             *trace_link_fexit = NULL;
 	struct bpf_map              *perf_map;
 	struct bpf_map              *data_map;
-	const struct bpf_map_def    *data_map_def;
 	struct trace_configuration   trace_cfg;
 
 	if (idx >= progs->nr_of_progs || progs->nr_of_progs == 0) {
@@ -1332,9 +1346,7 @@ rlimit_loop:
 		goto error_exit;
 	}
 
-	data_map_def = bpf_map__def(data_map);
-	if (!data_map_def ||
-	    data_map_def->value_size != sizeof(trace_cfg)) {
+	if (bpf_map__value_size(data_map) != sizeof(trace_cfg)) {
 		pr_warn("ERROR: Can't find the correct sized .data MAP in the "
 			"trace program!\n");
 		goto error_exit;
@@ -1397,16 +1409,18 @@ rlimit_loop:
 	/* Load the bpf object into memory */
 	err = bpf_object__load(trace_obj);
 	if (err) {
-		char err_msg[STRERR_BUFSIZE];
-
 		if (err == -EPERM && !double_rlimit()) {
 			bpf_object__close(trace_obj);
 			goto rlimit_loop;
-		}
+		} else if (err == -E2BIG) {
+			print_compat_error("function load");
+		} else {
+			char err_msg[STRERR_BUFSIZE];
 
-		libbpf_strerror(err, err_msg, sizeof(err_msg));
-		pr_warn("ERROR: Can't load eBPF object: %s(%d)\n",
-			err_msg, err);
+			libbpf_strerror(err, err_msg, sizeof(err_msg));
+			pr_warn("ERROR: Can't load eBPF object: %s(%d)\n",
+				err_msg, err);
+		}
 		goto error_exit;
 	}
 
@@ -1415,8 +1429,12 @@ rlimit_loop:
 		trace_link_fentry = bpf_program__attach_trace(trace_prog_fentry);
 		err = libbpf_get_error(trace_link_fentry);
 		if (err) {
-			pr_warn("ERROR: Can't attach XDP trace fentry function: %s\n",
-				strerror(-err));
+			if (err == -ENOTSUPP)
+				print_compat_error("function attach");
+			else
+				pr_warn("ERROR: Can't attach XDP trace fentry "
+					"function: %s\n",
+					strerror(-err));
 			goto error_exit;
 		}
 	}
@@ -1505,7 +1523,6 @@ static bool load_xdp_trace_program(struct dumpopt *cfg,
 	struct xdp_program         *prog;
 	struct bpf_map             *perf_map;
 	struct bpf_map             *data_map;
-	const struct bpf_map_def   *data_map_def;
 	struct trace_configuration  trace_cfg;
 
 	if (!cfg || !progs)
@@ -1542,9 +1559,7 @@ static bool load_xdp_trace_program(struct dumpopt *cfg,
 		goto error_exit;
 	}
 
-	data_map_def = bpf_map__def(data_map);
-	if (!data_map_def ||
-	    data_map_def->value_size != sizeof(trace_cfg)) {
+	if (bpf_map__value_size(data_map) != sizeof(trace_cfg)) {
 		pr_warn("ERROR: Can't find the correct sized .data MAP in the xdp program!\n");
 		goto error_exit;
 	}
